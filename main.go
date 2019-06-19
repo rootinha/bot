@@ -15,10 +15,7 @@ const cfgFileName = ".rootinha-bot.yaml"
 var cfgFile string
 
 func main() {
-
-	r := New()
-
-	cmd := newCmd(r)
+	cmd := newCmd()
 
 	if err := cmd.Execute(); err != nil {
 		logrus.Error(err)
@@ -26,7 +23,7 @@ func main() {
 	}
 }
 
-func newCmd(r *Rootinha) *cobra.Command {
+func newCmd() *cobra.Command {
 	cobra.OnInitialize(func() {
 		if cfgFile == "" {
 			cfgFile = cfgFileName
@@ -47,8 +44,16 @@ func newCmd(r *Rootinha) *cobra.Command {
 		Short: "",
 		Long:  `.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			mapstructure.Decode(viper.AllSettings()["bot"], r.Config)
-			r.Config.Compile()
+			var c = &BotConfig{}
+			err := mapstructure.Decode(viper.AllSettings()["bot"], c)
+			if err != nil {
+				return err
+			}
+
+			r, err := New(c)
+			if err != nil {
+				return err
+			}
 
 			return r.Start()
 		},

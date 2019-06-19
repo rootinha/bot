@@ -1,153 +1,93 @@
 package main
 
 import (
-	"bytes"
-	"context"
+	"fmt"
 	"regexp"
 	"strings"
-	"text/template"
 
-	"github.com/nlopes/slack"
-	"github.com/rootinha/bot/plugins/github"
+	"github.com/imdario/mergo"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
-type BotConfig struct {
-	Slack    *Slack
-	GitHub   *GitHub `yaml:"github"`
-	Entities []*Entity
-	Intents  []*Intent
-}
-
-type Slack struct {
-	Token string
-	User  string
-}
-
-type GitHub struct {
-	URL    string `yaml:"url"`
-	APIURL string `yaml:"apiurl"`
-	Token  string `yaml:"token"`
-}
-
-type Entity struct {
-	Name   string
-	Format string
-	Values []string
-}
-
-type Intent struct {
-	Expression []string
-	Regex      []*regexp.Regexp
-	Plugin     *Plugin
-	Response   *Response
-}
-
-type Response struct {
-	Template string
-}
-
-func (c *BotConfig) Compile() {
-	for _, it := range c.Intents {
-		it.Regex = make([]*regexp.Regexp, len(it.Expression))
-		for i, exp := range it.Expression {
-			it.Regex[i] = regexp.MustCompile(exp)
-		}
-	}
-}
-
 type Rootinha struct {
-	Config *BotConfig
+	config  *BotConfig
+	plugins map[string]Plugin
 }
 
-var (
-	reMention, _ = regexp.Compile(`^(?P<user>\<@\w+\>)(?P<message>.*)$`)
-)
+func New(c *BotConfig) (*Rootinha, error) {
 
-type Plugin struct{}
+	c.compileIntents()
 
-func New() *Rootinha {
-	return &Rootinha{
-		Config: &BotConfig{},
+	//TODO check if it is better to use a register or init package
+	//Maybe the plugin should be responsible for creating your dependencies
+	//and defining your name
+	//plugin init func
+	gh, err := NewGitHubPlugin(c.GitHub.APIURL, c.GitHub.Token)
+	if err != nil {
+		return nil, err
 	}
+
+	return &Rootinha{
+		config: c,
+		plugins: map[string]Plugin{
+			"github": gh,
+		},
+	}, nil
 }
 
 func (r *Rootinha) Start() error {
 
-	api := slack.New(r.Config.Slack.Token)
-	rtm := api.NewRTM()
-	go rtm.ManageConnection()
+	logrus.Info("starting the bot...")
 
-	cli, err := github.New(r.Config.GitHub.APIURL, r.Config.GitHub.Token)
-	if err != nil {
-		return err
-	}
+	slack := NewSlack(r.config.Slack.Token, r.config.Slack.User, r.config.Slack.UserId)
+	return slack.StartRTM(r)
+}
 
-	for {
-		select {
-		case msg := <-rtm.IncomingEvents:
-			switch ev := msg.Data.(type) {
-			case *slack.MessageEvent:
+func (r *Rootinha) CreateConversation(message, channel string) (*Conversation, error) {
+	for _, it := range r.config.Intents {
+		for _, re := range it.Regex {
 
-				ok, mention, text := findByMention(ev.Text, r.Config.Slack.User)
-
-				logrus.Info("found mention: ", ok)
-				logrus.Info("user: ", mention)
-				logrus.Info("message: ", text)
-				logrus.Info("message: ", ev.Text)
-
-				if ok {
-
-					rtm.SendMessage(rtm.NewTypingMessage(ev.Channel))
-
-					for _, it := range r.Config.Intents {
-						tmp, err := template.New("tmpl").Parse(it.Response.Template)
-						if err != nil {
-							logrus.Error(err)
-						}
-
-						for _, re := range it.Regex {
-							res := extractEntities(re, strings.TrimSpace(text))
-							if len(res) == 0 {
-								continue
-							}
-
-							prs, err := cli.ListPullRequests(context.Background(), "clarobr", res["repository"], res["state"])
-							if err != nil {
-								logrus.Error(err)
-							}
-
-							for _, pr := range prs {
-								var tpl bytes.Buffer
-								err = tmp.Execute(&tpl, pr)
-								if err != nil {
-									logrus.Error(err)
-								}
-								rtm.SendMessage(rtm.NewOutgoingMessage(tpl.String(), ev.Channel))
-							}
-
-						}
-					}
-				}
-
-			case *slack.RTMError:
-				logrus.Error(ev.Error())
-			case *slack.InvalidAuthEvent:
-				logrus.Error("invalid credentials")
-			default:
-				// Take no action
+			c := NewConversation(message, channel)
+			params, ok := r.extractParams(re, strings.TrimSpace(c.Text))
+			if !ok {
+				continue
 			}
+
+			err := r.validateParams(params)
+			if err != nil {
+				return nil, err
+			}
+
+			err = mergo.Merge(&params, it.Plugin.Params)
+			if err != nil {
+				logrus.WithError(err).Error("could not merge the params")
+			}
+
+			c.Params = params
+			c.ResponseTmpl = it.Response.Template
+
+			p, ok := r.plugins[it.Plugin.Name]
+			if !ok {
+				return nil, errors.New(fmt.Sprintf("plugin not found [%s]", it.Plugin.Name))
+			}
+
+			c.Action, ok = p.ListActions()[it.Plugin.Action]
+			if !ok {
+				return nil, errors.New(fmt.Sprintf("action not found [%s]", it.Plugin.Action))
+			}
+			return c, nil
 		}
 	}
 
-	return nil
+	return nil, errors.New("no intent has been found")
 }
 
-func extractEntities(re *regexp.Regexp, text string) map[string]string {
+func (r *Rootinha) extractParams(re *regexp.Regexp, text string) (map[string]string, bool) {
 	match := re.FindStringSubmatch(text)
 
 	if len(match) == 0 {
-		return make(map[string]string)
+		return nil, false
 	}
 
 	result := make(map[string]string)
@@ -160,15 +100,30 @@ func extractEntities(re *regexp.Regexp, text string) map[string]string {
 		}
 	}
 
-	return result
+	return result, true
 }
 
-func findByMention(msg, user string) (bool, string, string) {
-	match := reMention.FindStringSubmatch(msg)
+func (r *Rootinha) validateParams(params map[string]string) error {
+	var notfound []string
 
-	if len(match) >= 3 {
-		return true, match[1], strings.TrimSpace(match[2])
+	for _, e := range r.config.Entities {
+		val, ok := params[e.Name]
+		if ok {
+			var found bool
+			for _, ee := range e.Values {
+				if ee == val {
+					found = true
+				}
+			}
+			if !found {
+				notfound = append(notfound, e.Name)
+			}
+		}
 	}
 
-	return false, "", ""
+	if len(notfound) > 0 {
+		return errors.New(fmt.Sprintf("invalid parameter %s", strings.Join(notfound, ",")))
+	}
+
+	return nil
 }
